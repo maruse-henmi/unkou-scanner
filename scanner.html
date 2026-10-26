@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QR読み取り｜運行報告</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: sans-serif; background: #111; color: #fff; text-align: center; }
+    header { padding: 14px 16px; font-size: 20px; font-weight: bold; background: #1a5dab; }
+    #wrap { position: relative; width: 100%; max-width: 480px; margin: 0 auto; background: #000; }
+    #video { display: block; width: 100%; height: 70vh; object-fit: cover; }
+    #guide { position: absolute; top: 50%; left: 50%; width: 65%; aspect-ratio: 1 / 1; transform: translate(-50%, -50%);
+             border: 3px solid rgba(255,255,255,0.9); border-radius: 12px; box-shadow: 0 0 0 9999px rgba(0,0,0,0.3); pointer-events: none; }
+    #status { padding: 16px; font-size: 18px; line-height: 1.6; min-height: 60px; white-space: pre-wrap; }
+    #status.error { color: #ff8a8a; }
+    button { display: block; width: calc(100% - 32px); max-width: 448px; margin: 0 auto 12px; padding: 16px; font-size: 18px; border-radius: 8px; cursor: pointer; }
+    #startBtn { background: #1a5dab; color: #fff; border: none; display: none; }
+    #backBtn  { background: #fff; color: #333; border: none; }
+  </style>
+</head>
+<body>
+  <header>QRコード読み取り</header>
+  <div id="wrap">
+    <video id="video" playsinline muted autoplay></video>
+    <div id="guide"></div>
+  </div>
+  <div id="status">カメラを起動中...</div>
+  <button id="startBtn" onclick="startCamera()">📷 カメラを起動する</button>
+  <button id="backBtn" onclick="backToApp()">読み取らずにアプリへ戻る</button>
+  <canvas id="canvas" style="display:none;"></canvas>
+
+  <!-- jsQR.js は外部CDNから読まず、このファイルと同じ場所に置く -->
+  <script src="jsQR.js"></script>
+  <script>
+    // 戻り先URLはアプリから ?return= で受け取る（このページにはGASのURLを書かない）
+    // GASウェブアプリの /exec URL の形式以外は受け付けない（悪用防止）
+    var RETURN_PATTERN = /^https:\/\/script\.google\.com\/(?:a\/macros\/[A-Za-z0-9.\-]+|macros)\/s\/[A-Za-z0-9_\-]+\/(?:exec|dev)$/;
+    var APP_URL = (function() {
+      var url = '';
+      try { url = new URLSearchParams(location.search).get('return') || sessionStorage.getItem('qrReturnUrl') || ''; } catch(e) {}
+      if (!RETURN_PATTERN.test(url)) return '';
+      try { sessionStorage.setItem('qrReturnUrl', url); } catch(e) {}
+      return url;
+    })();
+
+    var SCAN_INTERVAL = 250;  // 解析間隔(ms)
+    var SCAN_MAX      = 640;  // 解析時の最大辺(px)。小さいQRが読めない場合は800程度に上げる
+    var stream = null, timer = null, scanning = false, done = false;
+
+    function setStatus(msg, isError) {
+      var el = document.getElementById('status');
+      el.innerText = msg;
+      el.className = isError ? 'error' : '';
+    }
+
+    function startCamera() {
+      document.getElementById('startBtn').style.display = 'none';
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setStatus('この端末・ブラウザではカメラを使用できません。\nアプリに戻り「写真を撮って読み取る」をお使いください。', true);
+        return;
+      }
+      setStatus('カメラを起動中...');
+      navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      })
+      .then(function(s) {
+        stream = s;
+        var video = document.getElementById('video');
+        video.srcObject = s;
+        return video.play();
+      })
+      .then(function() {
+        setStatus('QRコードを枠内に映してください');
+        scanning = true;
+        scheduleScan();
+      })
+      .catch(function(err) {
+        stopCamera();
+        document.getElementById('startBtn').style.display = 'block';
+        if (err && err.name === 'NotAllowedError') {
+          setStatus('カメラの使用が許可されていません。\nブラウザ（またはスマホの設定）でこのページのカメラを許可してから、下のボタンを押してください。', true);
+        } else {
+          setStatus('カメラを起動できませんでした（' + (err && err.name ? err.name : '不明なエラー') + '）。', true);
+        }
+      });
+    }
+
+    function scheduleScan() { timer = setTimeout(scanFrame, SCAN_INTERVAL); }
+
+    function scanFrame() {
+      if (!scanning) return;
+      var video = document.getElementById('video');
+      if (video.readyState < 2 || !video.videoWidth) { scheduleScan(); return; }
+
+      var scale  = Math.min(1, SCAN_MAX / Math.max(video.videoWidth, video.videoHeight));
+      var w      = Math.round(video.videoWidth * scale), h = Math.round(video.videoHeight * scale);
+      var canvas = document.getElementById('canvas');
+      var ctx    = canvas.getContext('2d', { willReadFrequently: true });
+      canvas.width = w; canvas.height = h;
+      ctx.drawImage(video, 0, 0, w, h);
+
+      var code = null;
+      try { code = jsQR(ctx.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: 'attemptBoth' }); } catch(e) {}
+
+      if (code && code.data) {
+        onDetected(code.data);
+        return;
+      }
+      scheduleScan();
+    }
+
+    function onDetected(value) {
+      if (done) return;
+      done = true;
+      stopCamera();
+      if (navigator.vibrate) navigator.vibrate(100);
+      setStatus('読み取りました。アプリに戻ります...');
+      // QRの中身は画面に表示せず、そのままアプリへ渡す
+      location.replace(APP_URL + '?qr=' + encodeURIComponent(value));
+    }
+
+    function stopCamera() {
+      scanning = false;
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (stream) { stream.getTracks().forEach(function(t) { t.stop(); }); stream = null; }
+      var video = document.getElementById('video');
+      try { video.pause(); } catch(e) {}
+      video.srcObject = null;
+    }
+
+    function backToApp() {
+      stopCamera();
+      if (!APP_URL) return;
+      location.replace(APP_URL);
+    }
+
+    // 画面が裏に回ったらカメラを止め、戻ったら再起動する
+    document.addEventListener('visibilitychange', function() {
+      if (done) return;
+      if (document.hidden) { stopCamera(); }
+      else if (!stream) { startCamera(); }
+    });
+
+    if (!APP_URL) {
+      document.getElementById('backBtn').style.display = 'none';
+      setStatus('このページはアプリの「カメラを起動して読み取る」ボタンから開いてください。', true);
+    } else if (typeof jsQR === 'undefined') {
+      setStatus('QR読み取りライブラリ（jsQR.js）を読み込めませんでした。\n電波状況を確認して再読み込みしてください。', true);
+    } else {
+      startCamera();
+    }
+  </script>
+</body>
+</html>
